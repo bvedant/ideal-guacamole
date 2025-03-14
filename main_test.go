@@ -60,7 +60,7 @@ func TestChatServer_MessageBroadcast(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(s.URL, "http")
 
-	// Connect two test clients
+	// Connect first client
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
 
@@ -70,20 +70,44 @@ func TestChatServer_MessageBroadcast(t *testing.T) {
 	}
 	defer c1.Close(websocket.StatusNormalClosure, "")
 
+	// Read the welcome message for first client
+	var msg Message
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second*5)
+	if err := wsjson.Read(ctx, c1, &msg); err != nil {
+		t.Fatalf("Failed to read welcome message for client 1: %v", err)
+	}
+	cancel()
+	if msg.Type != "system" || !strings.Contains(msg.Content, "user1 has joined") {
+		t.Fatalf("Unexpected welcome message for client 1: %+v", msg)
+	}
+
+	// Connect second client
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second*5)
 	c2, _, err := websocket.Dial(ctx, wsURL+"?username=user2", &websocket.DialOptions{})
 	if err != nil {
 		t.Fatalf("Failed to connect client 2: %v", err)
 	}
+	cancel()
 	defer c2.Close(websocket.StatusNormalClosure, "")
 
-	// Skip welcome messages
-	var msg Message
-	for i := 0; i < 2; i++ {
-		ctx, cancel = context.WithTimeout(context.Background(), time.Second*5)
-		if err := wsjson.Read(ctx, c1, &msg); err != nil {
-			t.Fatalf("Failed to read welcome message: %v", err)
-		}
-		cancel()
+	// Read join message on client 1 for client 2's join
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second*5)
+	if err := wsjson.Read(ctx, c1, &msg); err != nil {
+		t.Fatalf("Failed to read join message on client 1: %v", err)
+	}
+	cancel()
+	if msg.Type != "system" || !strings.Contains(msg.Content, "user2 has joined") {
+		t.Fatalf("Unexpected join message on client 1: %+v", msg)
+	}
+
+	// Read own welcome message on client 2
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second*5)
+	if err := wsjson.Read(ctx, c2, &msg); err != nil {
+		t.Fatalf("Failed to read welcome message on client 2: %v", err)
+	}
+	cancel()
+	if msg.Type != "system" || !strings.Contains(msg.Content, "user2 has joined") {
+		t.Fatalf("Unexpected welcome message on client 2: %+v", msg)
 	}
 
 	// Send a message from client 1
@@ -97,14 +121,14 @@ func TestChatServer_MessageBroadcast(t *testing.T) {
 	}
 	cancel()
 
-	// Verify client 2 receives the message
+	// Read the message on client 2
 	ctx, cancel = context.WithTimeout(context.Background(), time.Second*5)
 	if err := wsjson.Read(ctx, c2, &msg); err != nil {
 		t.Fatalf("Client 2 failed to receive message: %v", err)
 	}
 	cancel()
 
-	if msg.Content != testMessage.Content || msg.Username != "user1" {
+	if msg.Type != "message" || msg.Content != testMessage.Content || msg.Username != "user1" {
 		t.Errorf("Unexpected message received: %+v", msg)
 	}
 }
