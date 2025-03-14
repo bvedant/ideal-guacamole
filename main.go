@@ -5,11 +5,21 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"regexp"
 	"sync"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+)
+
+const (
+	maxUsernameLength = 50
+	maxMessageLength  = 5000
+)
+
+var (
+	validUsernameRegex = regexp.MustCompile("^[a-zA-Z0-9_-]+$")
 )
 
 // Message represents a chat message
@@ -18,6 +28,20 @@ type Message struct {
 	Username string `json:"username"`
 	Content  string `json:"content"`
 	Time     string `json:"time"`
+}
+
+// Validate checks if the message is valid
+func (m *Message) Validate() error {
+	if m.Content == "" {
+		return fmt.Errorf("message content cannot be empty")
+	}
+	if len(m.Content) > maxMessageLength {
+		return fmt.Errorf("message content too long (max %d characters)", maxMessageLength)
+	}
+	if m.Type != "" && m.Type != "message" && m.Type != "system" {
+		return fmt.Errorf("invalid message type: %s", m.Type)
+	}
+	return nil
 }
 
 // Client represents a connected chat client
@@ -66,20 +90,45 @@ func (cs *ChatServer) handleBroadcasts() {
 	}
 }
 
+// validateUsername checks if a username is valid
+func (cs *ChatServer) validateUsername(username string) error {
+	if username == "" {
+		return nil // Empty username will be auto-generated
+	}
+	if len(username) > maxUsernameLength {
+		return fmt.Errorf("username too long (max %d characters)", maxUsernameLength)
+	}
+	if !validUsernameRegex.MatchString(username) {
+		return fmt.Errorf("username contains invalid characters (only letters, numbers, underscore, and hyphen allowed)")
+	}
+	return nil
+}
+
 // handleConnection manages a WebSocket connection
 func (cs *ChatServer) handleConnection(w http.ResponseWriter, r *http.Request) {
+	// Validate username before upgrading connection
+	username := r.URL.Query().Get("username")
+	if err := cs.validateUsername(username); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		// Allow connections from any origin for development purposes
 		InsecureSkipVerify: true,
 	})
 	if err != nil {
+		if websocket.CloseStatus(err) == websocket.StatusProtocolError {
+			http.Error(w, "Upgrade Required", http.StatusUpgradeRequired)
+		} else {
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+		}
 		log.Printf("WebSocket accept error: %v", err)
 		return
 	}
 	defer c.CloseNow()
 
-	// Get username from query parameter
-	username := r.URL.Query().Get("username")
+	// Auto-generate username if not provided
 	if username == "" {
 		username = fmt.Sprintf("User-%d", time.Now().UnixNano()%10000)
 	}
@@ -125,6 +174,12 @@ func (cs *ChatServer) handleConnection(w http.ResponseWriter, r *http.Request) {
 		msg.Time = time.Now().Format(time.RFC3339)
 		if msg.Type == "" {
 			msg.Type = "message"
+		}
+
+		// Validate message
+		if err := msg.Validate(); err != nil {
+			log.Printf("Invalid message from %s: %v", client.username, err)
+			continue
 		}
 
 		// Broadcast message to all clients

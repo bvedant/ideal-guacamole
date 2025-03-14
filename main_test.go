@@ -497,3 +497,267 @@ func TestChatServer_BroadcastConcurrentModification(t *testing.T) {
 		t.Errorf("Expected at most %d clients after concurrent operations, got %d", expectedClients, clientCount)
 	}
 }
+
+func TestChatServer_WebSocketAcceptError(t *testing.T) {
+	server := NewChatServer()
+	server.Run()
+
+	// Create a server that will trigger websocket accept error
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Trigger accept error by not setting websocket headers
+		server.handleConnection(w, r)
+	}))
+	defer s.Close()
+
+	// Try to connect without websocket upgrade
+	resp, err := http.Get(s.URL)
+	if err != nil {
+		t.Fatalf("Failed to make request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUpgradeRequired {
+		t.Errorf("Expected status UpgradeRequired (426), got %v", resp.Status)
+	}
+}
+
+func TestChatServer_MessageValidation(t *testing.T) {
+	server := NewChatServer()
+	server.Run()
+
+	s := httptest.NewServer(http.HandlerFunc(server.handleConnection))
+	defer s.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(s.URL, "http")
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	c, _, err := websocket.Dial(ctx, wsURL+"?username=testuser", &websocket.DialOptions{})
+	cancel()
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	// Skip welcome message
+	var msg Message
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second*5)
+	if err := wsjson.Read(ctx, c, &msg); err != nil {
+		t.Fatalf("Failed to read welcome message: %v", err)
+	}
+	cancel()
+
+	testCases := []struct {
+		name    string
+		message Message
+		valid   bool
+	}{
+		{
+			name: "Empty message",
+			message: Message{
+				Type:    "message",
+				Content: "",
+			},
+			valid: false,
+		},
+		{
+			name: "Very long message",
+			message: Message{
+				Type:    "message",
+				Content: strings.Repeat("a", 10000),
+			},
+			valid: false,
+		},
+		{
+			name: "Invalid message type",
+			message: Message{
+				Type:    "invalid_type",
+				Content: "test",
+			},
+			valid: false,
+		},
+		{
+			name: "Valid message",
+			message: Message{
+				Type:    "message",
+				Content: "Hello, World!",
+			},
+			valid: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel = context.WithTimeout(context.Background(), time.Second*5)
+			err := wsjson.Write(ctx, c, tc.message)
+			cancel()
+			if err != nil {
+				t.Fatalf("Failed to send message: %v", err)
+			}
+
+			// For valid messages, we should be able to read them back
+			if tc.valid {
+				ctx, cancel = context.WithTimeout(context.Background(), time.Second*5)
+				var receivedMsg Message
+				err := wsjson.Read(ctx, c, &receivedMsg)
+				cancel()
+				if err != nil {
+					t.Fatalf("Failed to read message: %v", err)
+				}
+
+				if receivedMsg.Content != tc.message.Content {
+					t.Errorf("Expected content %q, got %q", tc.message.Content, receivedMsg.Content)
+				}
+			}
+		})
+	}
+}
+
+func TestChatServer_UsernameValidation(t *testing.T) {
+	server := NewChatServer()
+	server.Run()
+
+	s := httptest.NewServer(http.HandlerFunc(server.handleConnection))
+	defer s.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(s.URL, "http")
+
+	testCases := []struct {
+		name     string
+		username string
+		wantErr  bool
+	}{
+		{
+			name:     "Very long username",
+			username: strings.Repeat("a", 100),
+			wantErr:  true,
+		},
+		{
+			name:     "Username with special characters",
+			username: "user@#$%",
+			wantErr:  true,
+		},
+		{
+			name:     "Empty username (should auto-generate)",
+			username: "",
+			wantErr:  false,
+		},
+		{
+			name:     "Valid username",
+			username: "testuser123",
+			wantErr:  false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+			url := wsURL
+			if tc.username != "" {
+				url += "?username=" + tc.username
+			}
+			c, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{})
+			cancel()
+
+			if tc.wantErr {
+				if err == nil {
+					c.Close(websocket.StatusNormalClosure, "")
+					t.Error("Expected error, got nil")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("Failed to connect: %v", err)
+			}
+			defer c.Close(websocket.StatusNormalClosure, "")
+
+			// Read welcome message
+			var msg Message
+			ctx, cancel = context.WithTimeout(context.Background(), time.Second*5)
+			if err := wsjson.Read(ctx, c, &msg); err != nil {
+				t.Fatalf("Failed to read welcome message: %v", err)
+			}
+			cancel()
+
+			if tc.username == "" && !strings.Contains(msg.Content, "User-") {
+				t.Errorf("Expected auto-generated username, got: %s", msg.Content)
+			} else if tc.username != "" && !strings.Contains(msg.Content, tc.username) {
+				t.Errorf("Expected username %q in message, got: %s", tc.username, msg.Content)
+			}
+		})
+	}
+}
+
+func TestChatServer_SystemMessages(t *testing.T) {
+	server := NewChatServer()
+	server.Run()
+
+	s := httptest.NewServer(http.HandlerFunc(server.handleConnection))
+	defer s.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(s.URL, "http")
+
+	// Connect first client
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	c1, _, err := websocket.Dial(ctx, wsURL+"?username=user1", &websocket.DialOptions{})
+	cancel()
+	if err != nil {
+		t.Fatalf("Failed to connect client 1: %v", err)
+	}
+	defer c1.Close(websocket.StatusNormalClosure, "")
+
+	// Read welcome message
+	var msg Message
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second*5)
+	if err := wsjson.Read(ctx, c1, &msg); err != nil {
+		t.Fatalf("Failed to read welcome message: %v", err)
+	}
+	cancel()
+
+	if msg.Type != "system" {
+		t.Errorf("Expected system message type, got %q", msg.Type)
+	}
+	if msg.Username != "Server" {
+		t.Errorf("Expected username 'Server', got %q", msg.Username)
+	}
+
+	// Connect second client to test join notification
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second*5)
+	c2, _, err := websocket.Dial(ctx, wsURL+"?username=user2", &websocket.DialOptions{})
+	cancel()
+	if err != nil {
+		t.Fatalf("Failed to connect client 2: %v", err)
+	}
+	defer c2.Close(websocket.StatusNormalClosure, "")
+
+	// Read join notification on first client
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second*5)
+	if err := wsjson.Read(ctx, c1, &msg); err != nil {
+		t.Fatalf("Failed to read join notification: %v", err)
+	}
+	cancel()
+
+	if msg.Type != "system" {
+		t.Errorf("Expected system message type for join notification, got %q", msg.Type)
+	}
+	if !strings.Contains(msg.Content, "user2 has joined") {
+		t.Errorf("Expected join notification for user2, got: %s", msg.Content)
+	}
+
+	// Test disconnect notification
+	c2.Close(websocket.StatusNormalClosure, "")
+
+	// Read leave notification on first client
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second*5)
+	if err := wsjson.Read(ctx, c1, &msg); err != nil {
+		t.Fatalf("Failed to read leave notification: %v", err)
+	}
+	cancel()
+
+	if msg.Type != "system" {
+		t.Errorf("Expected system message type for leave notification, got %q", msg.Type)
+	}
+	if !strings.Contains(msg.Content, "user2 has left") {
+		t.Errorf("Expected leave notification for user2, got: %s", msg.Content)
+	}
+}
