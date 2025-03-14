@@ -1,0 +1,20 @@
+.chat-container {
+    height: 90vh;
+    max-height: 700px;
+}
+
+.messages-container {
+    overflow-y: auto;
+}
+
+.message-user {
+    align-self: flex-end;
+}
+
+.message-other {
+    align-self: flex-start;
+}
+
+.message-system {
+    align-self: center;
+}
