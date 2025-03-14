@@ -111,8 +111,9 @@ func (cs *ChatServer) handleConnection(w http.ResponseWriter, r *http.Request) {
 		err := wsjson.Read(ctx, c, &msg)
 		cancel()
 
-		if websocket.CloseStatus(err) == websocket.StatusGoingAway {
-			log.Printf("Client %s disconnected", client.username)
+		if websocket.CloseStatus(err) == websocket.StatusGoingAway ||
+			websocket.CloseStatus(err) == websocket.StatusNormalClosure {
+			log.Printf("Client %s disconnected gracefully", client.username)
 			break
 		} else if err != nil {
 			log.Printf("WebSocket read error: %v", err)
